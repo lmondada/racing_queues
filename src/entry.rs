@@ -66,4 +66,12 @@ impl Side {
     pub fn entry<T>(&self, v: T) -> Entry<T> {
         self.map(|_| v)
     }
+
+    pub fn from_index(u: usize) -> Self {
+        match u {
+            0 => Self::Left(()),
+            1 => Self::Right(()),
+            _ => panic!("Invalid index for Side"),
+        }
+    }
 }
