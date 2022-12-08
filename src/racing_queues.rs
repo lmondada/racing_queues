@@ -1,9 +1,9 @@
-use std::{collections::VecDeque, mem};
+use std::{collections::VecDeque, mem, ops::Range};
 
 use crate::Entry;
 
 /// Racing Queues to keep track of overlaps between two queues
-/// 
+///
 /// A racing queue is formed of two queues (the left and the right queue).
 /// Each queue can be viewed as forming an interval from the minimum in the queue
 /// to the maximum.
@@ -15,7 +15,7 @@ use crate::Entry;
 ///
 /// To be memory efficient, racing queues automatically discard elements that
 /// become too small as larger elements are inserted left or right.
-/// 
+///
 /// # Example
 /// ```
 /// use racing_queues::{RacingQueues, Entry};
@@ -30,7 +30,7 @@ use crate::Entry;
 /// let overlap: Vec<_> = r.drain_overlap().collect();
 /// assert_eq!(overlap, vec![Entry::Right(3), Entry::Left(4), Entry::Right(4)]);
 /// ```
-/// 
+///
 /// This will panic, as the third element is not in non-decreasing order:
 /// ```should_panic
 /// use racing_queues::{RacingQueues, Entry, Side};
@@ -82,35 +82,79 @@ impl<T: Ord> RacingQueues<T> {
         self.push(Entry::Right(v))
     }
 
-    pub fn drain_overlap(&mut self) -> impl Iterator<Item = Entry<T>> + '_ {
-        let mut queues = self.queues_mut();
-        queues.sort_by(|a, b| a.back().cmp(&b.back()));
-        let [small, large] = queues;
-        // For small, delete tail
-        while small.front() < large.front() {
-            small.pop_front();
-        }
-        // For large, find out the interval [0..overlap) to drain
-        let overlap = if let Some(max_in_small) = small.back() {
-            // Find overlap s.t. large[overlap - 1] <= small.back() < large[overlap]
-            match large.binary_search(max_in_small) {
+    pub fn overlap(&self) -> impl Iterator<Item = Entry<&T>> + '_ {
+        let [r0, r1] = self.overlap_range();
+        LeftRightIter::new(
+            r0.map(|i| &self.queues[0][i]),
+            r1.map(|i| &self.queues[1][i]),
+        )
+    }
+
+    fn overlap_range(&self) -> [Range<usize>; 2] {
+        let mut start_range = [0; 2];
+        let mut end_range = [0; 2];
+
+        // Compare tops of queues to find end of overlap
+        let mut inds = [0, 1];
+        inds.sort_by(|a, b| self.queues[*a].back().cmp(&self.queues[*b].back()));
+        let [small, large] = inds;
+
+        // For small queue, end of overlap is the end of the queue
+        end_range[small] = self.queues[small].len();
+        // For large queue, end of overlap is overlap s.t.
+        // large[overlap - 1] <= small.back() < large[overlap]
+        end_range[large] = if let Some(max_of_small) = self.queues[small].back() {
+            match self.queues[large].binary_search(max_of_small) {
                 Ok(ind) => {
                     // edge past this entry
-                    let v = &large[ind];
-                    ((ind + 1)..large.len())
-                        .find(|ind| large[*ind] != *v)
-                        .unwrap_or(large.len())
+                    let v = &self.queues[large][ind];
+                    ((ind + 1)..self.queues[large].len())
+                        .find(|ind| self.queues[large][*ind] != *v)
+                        .unwrap_or(self.queues[large].len())
                 }
                 Err(ind) => ind,
             }
         } else {
             0
         };
-        // Drain the whole of small
-        let it1 = small.drain(..);
-        // Drain [0..overlap) of large
-        let it2 = large.drain(..overlap);
-        LeftRightIter::new(it1, it2)
+
+        // Compare bottoms of queues to find beginning of overlap
+        let mut inds = [0, 1];
+        inds.sort_by(|a, b| self.queues[*a].front().cmp(&self.queues[*b].front()));
+        let [small, large] = inds;
+
+        // For large queue, beginning of overlap is the beginning of the queue
+        start_range[large] = 0;
+        // For small queue, beginning of overlap is overlap s.t.
+        // small[overlap - 1] < large.front() <= small[overlap]
+        start_range[small] = if let Some(min_of_large) = self.queues[large].front() {
+            match self.queues[small].binary_search(min_of_large) {
+                Ok(ind) => {
+                    // edge past this entry
+                    let v = &self.queues[small][ind];
+                    (0..ind).rev().find(|ind| self.queues[small][*ind] != *v).unwrap_or(0)
+                }
+                Err(ind) => ind,
+            }
+        } else {
+            self.queues[small].len()
+        };
+
+        [0, 1].map(|i| start_range[i]..end_range[i])
+    }
+
+    pub fn drain_overlap(&mut self) -> impl Iterator<Item = Entry<T>> + '_ {
+        let ranges = self.overlap_range();
+        // For efficiency, we start by draining the tail with elements too small
+        let mut its = self.queues_mut().into_iter().zip(ranges).map(|(q, r)| {
+            q.drain(0..r.start);
+            let r = 0..(r.end - r.start);
+            q.drain(r)
+        }).collect::<Vec<_>>().into_iter();
+        let it0 = its.next().unwrap();
+        let it1 = its.next().unwrap();
+
+        LeftRightIter::new(it0, it1)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Entry<&T>> + '_ {
@@ -261,11 +305,24 @@ mod tests {
         r.push_right(1);
         assert_eq!(r.queues, [vec![1, 2], vec![1, 1]]);
         r.push_right(4);
-        println!("{:?}", r);
         assert_eq!(r.queues, [vec![1, 2], vec![1, 1, 4]]);
         assert_eq!(
             r.drain_overlap().collect::<Vec<_>>(),
             [LEFT.entry(1), RIGHT.entry(1), RIGHT.entry(1), LEFT.entry(2)]
+        );
+    }
+
+    #[test]
+    fn racing_queue_fully_included() {
+        let mut r = RacingQueues::new();
+        r.push_left(1);
+        r.push_left(3);
+        r.push_left(5);
+        r.push_right(2);
+        r.push_right(3);
+        assert_eq!(
+            r.drain_overlap().collect::<Vec<_>>(),
+            [RIGHT.entry(2), LEFT.entry(3), RIGHT.entry(3)]
         );
     }
 }
