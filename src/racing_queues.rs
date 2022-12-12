@@ -1,4 +1,9 @@
-use std::{cmp, collections::VecDeque, mem, ops::Range};
+use std::{
+    cmp::{self, Reverse},
+    collections::VecDeque,
+    mem,
+    ops::{Index, Range},
+};
 
 use crate::Entry;
 
@@ -10,8 +15,8 @@ use crate::Entry;
 /// At any time, `drain_overlap` will pop and return all elements from either
 /// queue that belong to the intersection of the queue intervals.
 
-/// When restricted to either the left or right queue, all insertions must be
-/// made in non-decreasing order.
+/// When restricted to either the left or right queue, all insertions should be
+/// made in non-decreasing order. Non-ordered pushes are allowed but inefficient
 ///
 /// To be memory efficient, racing queues automatically discard elements that
 /// become too small as larger elements are inserted left or right.
@@ -27,23 +32,48 @@ use crate::Entry;
 /// assert_eq!(r, entries.into());
 /// r.push_left(4);
 /// r.push_right(4);
-/// let overlap: Vec<_> = r.drain_overlap().collect();
+/// let overlap: Vec<_> = r.drain_overlap(None).collect();
 /// assert_eq!(overlap, vec![Entry::Right(3), Entry::Left(4), Entry::Right(4)]);
-/// ```
-///
-/// This will panic, as the third element is not in non-decreasing order:
-/// ```should_panic
-/// use racing_queues::{RacingQueues, Entry, Side};
-/// let mut r = RacingQueues::new();
-/// r.push_left(2);
-/// // This is fine
-/// r.push_right(1);
-/// // This isn't
-/// r.push_left(1);
 /// ```
 #[derive(Clone, PartialEq, Debug)]
 pub struct RacingQueues<T> {
     queues: [VecDeque<T>; 2],
+}
+
+/// First index in sorted queue that is either `Greater` or `Less` than T
+///
+/// Note: little quirk: if ordering == Less, then ind is offset by one
+/// (because actual index could be -1)
+/// This works out nicely because ranges are [), ie including start but excluding end
+fn first_past<'a, T: Ord>(queue: &'a VecDeque<T>, limit: &T, ordering: cmp::Ordering) -> usize {
+    match ordering {
+        cmp::Ordering::Less => queue.partition_point(|v| v < limit),
+        cmp::Ordering::Greater => queue.partition_point(|v| v <= limit),
+        cmp::Ordering::Equal => panic!("Invalid Ordering"),
+    }
+}
+
+// A VecDeque with reversed ordering and indexing
+#[derive(PartialEq, Eq)]
+struct RevVecDeque<T>(VecDeque<T>);
+
+impl<T> Index<usize> for RevVecDeque<T> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.0[self.0.len() - index - 1]
+    }
+}
+
+impl<T: Ord> Ord for RevVecDeque<T> {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        Reverse(self).cmp(&Reverse(other))
+    }
+}
+impl<T: Ord> PartialOrd for RevVecDeque<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(&other))
+    }
 }
 
 impl<T: Ord> RacingQueues<T> {
@@ -51,13 +81,14 @@ impl<T: Ord> RacingQueues<T> {
         Self::default()
     }
 
+    // Push values in (more or less) increasing order
+    // Any values can be pushed, but small values are inefficient
     pub fn push(&mut self, v: Entry<T>) {
         let side = v.side();
         let insert_into = &mut self.queues[side.index()];
-        if Some(v.value()) < insert_into.back() {
-            panic!("Cannot insert smaller value")
-        }
-        insert_into.push_back(v.into_value());
+        let idx = insert_into.partition_point(|x| x < v.value());
+        insert_into.insert(idx, v.into_value());
+        // insert_into.push_back(v.into_value());
     }
 
     pub fn push_left(&mut self, v: T) {
@@ -81,15 +112,15 @@ impl<T: Ord> RacingQueues<T> {
         insert_into.push_front(v.into_value());
     }
 
-    pub fn overlap(&self) -> impl Iterator<Item = Entry<&T>> + '_ {
-        let [r0, r1] = self.overlap_range();
+    pub fn overlap(&self, limit: Option<&T>) -> impl Iterator<Item = Entry<&T>> + '_ {
+        let [r0, r1] = self.overlap_range(limit);
         LeftRightIter::new(
             r0.map(|i| &self.queues[0][i]),
             r1.map(|i| &self.queues[1][i]),
         )
     }
 
-    fn overlap_range(&self) -> [Range<usize>; 2] {
+    fn overlap_range(&self, limit: Option<&T>) -> [Range<usize>; 2] {
         let mut start_range = [0; 2];
         let mut end_range = [0; 2];
 
@@ -98,21 +129,19 @@ impl<T: Ord> RacingQueues<T> {
         inds.sort_by(|a, b| self.queues[*a].back().cmp(&self.queues[*b].back()));
         let [small, large] = inds;
 
-        // For small queue, end of overlap is the end of the queue
-        end_range[small] = self.queues[small].len();
+        // For small queue, end of overlap is the end of the queue, or limit
+        end_range[small] = if let Some(limit) = limit {
+            first_past(&self.queues[small], limit, cmp::Ordering::Greater)
+        } else {
+            self.queues[small].len()
+        };
         // For large queue, end of overlap is overlap s.t.
         // large[overlap - 1] <= small.back() < large[overlap]
         end_range[large] = if let Some(max_of_small) = self.queues[small].back() {
-            match self.queues[large].binary_search(max_of_small) {
-                Ok(ind) => {
-                    // edge past this entry
-                    let v = &self.queues[large][ind];
-                    ((ind + 1)..self.queues[large].len())
-                        .find(|ind| self.queues[large][*ind] != *v)
-                        .unwrap_or(self.queues[large].len())
-                }
-                Err(ind) => ind,
-            }
+            let max_of_small = limit
+                .map(|limit| cmp::min(limit, max_of_small))
+                .unwrap_or(max_of_small);
+            first_past(&self.queues[large], max_of_small, cmp::Ordering::Greater)
         } else {
             0
         };
@@ -127,26 +156,21 @@ impl<T: Ord> RacingQueues<T> {
         // For small queue, beginning of overlap is overlap s.t.
         // small[overlap - 1] < large.front() <= small[overlap]
         start_range[small] = if let Some(min_of_large) = self.queues[large].front() {
-            match self.queues[small].binary_search(min_of_large) {
-                Ok(ind) => {
-                    // edge past this entry
-                    let v = &self.queues[small][ind];
-                    (1..=ind)
-                        .rev()
-                        .find(|ind| self.queues[small][*ind - 1] != *v)
-                        .unwrap_or(0)
-                }
-                Err(ind) => ind,
-            }
+            first_past(&self.queues[small], min_of_large, cmp::Ordering::Less)
         } else {
             self.queues[small].len()
         };
 
+        // Make sure empty ranges still satisfy start <= end
+        for i in [0, 1] {
+            start_range[i] = cmp::min(start_range[i], end_range[i]);
+        }
+
         [0, 1].map(|i| start_range[i]..end_range[i])
     }
 
-    pub fn drain_overlap(&mut self) -> impl Iterator<Item = Entry<T>> + '_ {
-        let ranges = self.overlap_range();
+    pub fn drain_overlap(&mut self, limit: Option<&T>) -> impl Iterator<Item = Entry<T>> + '_ {
+        let ranges = self.overlap_range(limit);
         let mut its = self
             .queues_mut()
             .into_iter()
@@ -277,11 +301,35 @@ mod tests {
         );
         r.push_left(3);
         assert_eq!(
-            r.drain_overlap().collect::<Vec<_>>(),
+            r.drain_overlap(None).collect::<Vec<_>>(),
             vec![LEFT.entry(3), RIGHT.entry(3)]
         )
     }
 
+    #[test]
+    fn racing_queue_identical() {
+        let mut r = RacingQueues::new();
+        r.push_left(2);
+        r.push_left(2);
+        assert_eq!(
+            r,
+            vec![
+                Entry::Left(2),
+                Entry::Left(2),
+            ]
+            .into()
+        );
+        r.push_right(2);
+        assert_eq!(r.queues, [vec![2, 2], vec![2]]);
+        assert_eq!(
+            r.drain_overlap(Some(&2)).collect::<Vec<_>>(),
+            [
+                LEFT.entry(2),
+                LEFT.entry(2),
+                RIGHT.entry(2),
+            ]
+        );
+    }
     #[test]
     fn racing_queue_several_identical() {
         let mut r = RacingQueues::new();
@@ -304,7 +352,7 @@ mod tests {
         r.push_right(1);
         assert_eq!(r.queues, [vec![1, 2, 2, 2, 2], vec![1]]);
         assert_eq!(
-            r.drain_overlap().collect::<Vec<_>>(),
+            r.drain_overlap(None).collect::<Vec<_>>(),
             [LEFT.entry(1), RIGHT.entry(1)]
         );
         assert_eq!(r.queues, [vec![2, 2, 2, 2], vec![]]);
@@ -323,7 +371,7 @@ mod tests {
         r.push_right(4);
         assert_eq!(r.queues, [vec![1, 2], vec![0, 1, 1, 4]]);
         assert_eq!(
-            r.drain_overlap().collect::<Vec<_>>(),
+            r.drain_overlap(None).collect::<Vec<_>>(),
             [LEFT.entry(1), RIGHT.entry(1), RIGHT.entry(1), LEFT.entry(2)]
         );
     }
@@ -337,7 +385,7 @@ mod tests {
         r.push_right(2);
         r.push_right(3);
         assert_eq!(
-            r.drain_overlap().collect::<Vec<_>>(),
+            r.drain_overlap(None).collect::<Vec<_>>(),
             [RIGHT.entry(2), LEFT.entry(3), RIGHT.entry(3)]
         );
     }
@@ -348,26 +396,43 @@ mod tests {
         r.push_left(1);
         r.push_left(3);
         r.push_left(5);
-        assert_eq!(r.overlap().collect::<Vec<_>>(), []);
+        assert_eq!(r.overlap(None).collect::<Vec<_>>(), []);
         let r2 = r.clone();
-        r.drain_overlap();
+        r.drain_overlap(None);
         assert_eq!(r, r2);
         r.push_right(3);
-        println!("{:?}", r.queues);
         assert_eq!(
-            r.overlap()
+            r.overlap(None)
                 .map(|e| e.map(|u| u.clone()))
                 .collect::<Vec<_>>(),
             [LEFT.entry(3), RIGHT.entry(3)]
         );
         r.push_right(6);
         assert_eq!(
-            r.overlap()
+            r.overlap(None)
                 .map(|e| e.map(|u| u.clone()))
                 .collect::<Vec<_>>(),
             [LEFT.entry(3), RIGHT.entry(3), LEFT.entry(5)]
         );
-        r.drain_overlap();
+        assert_eq!(
+            r.overlap(Some(&5))
+                .map(|e| e.map(|u| u.clone()))
+                .collect::<Vec<_>>(),
+            [LEFT.entry(3), RIGHT.entry(3), LEFT.entry(5)]
+        );
+        assert_eq!(
+            r.overlap(Some(&4))
+                .map(|e| e.map(|u| u.clone()))
+                .collect::<Vec<_>>(),
+            [LEFT.entry(3), RIGHT.entry(3)]
+        );
+        assert_eq!(
+            r.overlap(Some(&2))
+                .map(|e| e.map(|u| u.clone()))
+                .collect::<Vec<_>>(),
+            []
+        );
+        r.drain_overlap(None);
         assert_eq!(r.queues, [vec![], vec![6]]);
     }
 
@@ -378,6 +443,6 @@ mod tests {
         r.push_left(3);
         r.push_left(5);
         r.push_right(6);
-        assert_eq!(r.overlap().count(), 0);
+        assert_eq!(r.overlap(None).count(), 0);
     }
 }
